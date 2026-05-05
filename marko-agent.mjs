@@ -16,8 +16,9 @@ const DEFAULT_OUT = '';
 
 const DEFAULTS = {
   ollama_host: 'http://localhost:11434',
-  planner_provider: 'claude',
-  planner_model: 'qwen3:8b',
+  planner_provider: 'ollama',
+  final_review_provider: 'claude',
+  planner_model: 'qwen3-coder:30b',
   coder_model_php: 'qwen3-coder:30b',
   coder_model_js: 'qwen3-coder:30b',
   reviewer_model: 'qwen3-coder:30b',
@@ -58,6 +59,11 @@ function loadConfig() {
     if (stored.coder_model && !stored.coder_model_php) stored.coder_model_php = stored.coder_model;
     if (stored.coder_model && !stored.coder_model_js) stored.coder_model_js = stored.coder_model;
     delete stored.coder_model;
+    // Backward compat: pre-split configs (no final_review_provider key) inherit from planner_provider
+    // so existing behavior is preserved on upgrade.
+    if (!('final_review_provider' in stored) && 'planner_provider' in stored) {
+      stored.final_review_provider = stored.planner_provider;
+    }
     return { ...DEFAULTS, ...stored };
   } catch { return { ...DEFAULTS }; }
 }
@@ -324,6 +330,17 @@ async function doctor() {
     ok(`provider: ollama (model: ${cfg.planner_model})`);
   }
 
+  console.log('\nFinal review:');
+  if (cfg.final_review_provider === 'claude') {
+    if (claudeAvailable()) {
+      ok('claude CLI  (holistic cross-file audit after Ollama codes the plugin)');
+    } else {
+      warn(`final_review_provider=claude but \`claude\` CLI not on PATH — final review will be skipped`);
+    }
+  } else {
+    warn('final_review_provider=ollama — Claude final audit disabled (cross-file bugs may slip through)');
+  }
+
   console.log('\nOllama:');
   let models = [];
   try {
@@ -363,10 +380,19 @@ async function setup() {
   cfg.planner_provider = await select({
     message: 'Planner (the "thinking" model that triages and plans)',
     choices: [
+      { name: 'ollama  — fully local, uses an Ollama model (recommended; saves Claude tokens)', value: 'ollama' },
       { name: `claude  — uses your Claude subscription via \`claude\` CLI${claudeOk ? '' : '  (CLI not detected!)'}`, value: 'claude' },
-      { name: 'ollama  — fully local, uses an Ollama model', value: 'ollama' },
     ],
     default: cfg.planner_provider,
+  });
+
+  cfg.final_review_provider = await select({
+    message: 'Final review (holistic audit of the whole plugin after Ollama codes it)',
+    choices: [
+      { name: `claude  — uses your Claude subscription via \`claude\` CLI${claudeOk ? '' : '  (CLI not detected!)'}  (recommended; catches cross-file bugs Ollama misses)`, value: 'claude' },
+      { name: 'ollama  — skip Claude entirely; rely on per-file Ollama reviewer only', value: 'ollama' },
+    ],
+    default: cfg.final_review_provider,
   });
 
   cfg.ollama_host = await input({ message: 'Ollama host URL', default: cfg.ollama_host });
@@ -580,7 +606,7 @@ Return your audit as JSON only.`;
 }
 
 async function runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles) {
-  if (cfg.planner_provider !== 'claude') return;
+  if (cfg.final_review_provider !== 'claude') return;
   if (!claudeAvailable()) {
     warn(`claude CLI not found — skipping final review`);
     return;
@@ -796,7 +822,7 @@ async function buildCmd(request, opts = {}) {
     generatedFiles.set(file.path, content);
   }
 
-  if (cfg.planner_provider === 'claude') {
+  if (cfg.final_review_provider === 'claude') {
     console.log(`\n${c.cyan}🔎 Final Claude review...${c.reset}`);
     await runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles);
   }
