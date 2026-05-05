@@ -16,6 +16,8 @@ const DEFAULT_OUT = '';
 
 const DEFAULTS = {
   ollama_host: 'http://localhost:11434',
+  inference_provider: 'ollama', // 'ollama' or 'lmstudio' (OpenAI-compatible)
+  lmstudio_host: 'http://localhost:1234',
   planner_provider: 'ollama',
   final_review_provider: 'claude',
   planner_model: 'qwen3-coder:30b',
@@ -91,6 +93,22 @@ async function ollamaTags(host) {
   return d.models.map(m => m.name);
 }
 
+async function lmstudioModels(host) {
+  const r = await fetch(`${host}/v1/models`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const d = await r.json();
+  return (d.data || []).map(m => m.id);
+}
+
+async function listInferenceModels(cfg) {
+  if (cfg.inference_provider === 'lmstudio') return lmstudioModels(cfg.lmstudio_host);
+  return ollamaTags(cfg.ollama_host);
+}
+
+function inferenceLabel(cfg) {
+  return cfg.inference_provider === 'lmstudio' ? `lmstudio (${cfg.lmstudio_host})` : `ollama (${cfg.ollama_host})`;
+}
+
 function stripFences(t) {
   let s = t.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   const m = s.match(/```(?:[a-z]+)?\s*([\s\S]*?)\s*```/);
@@ -124,7 +142,7 @@ function claudeChat(system, user) {
   return wrapper.result;
 }
 
-async function chat(cfg, model, system, user, jsonMode = false) {
+async function chatOllama(cfg, model, system, user, jsonMode) {
   const ollama = new Ollama({ host: cfg.ollama_host });
   const opts = {
     model,
@@ -139,6 +157,37 @@ async function chat(cfg, model, system, user, jsonMode = false) {
   if (jsonMode) opts.format = 'json';
   const r = await ollama.chat(opts);
   return r.message.content;
+}
+
+async function chatLMStudio(cfg, model, system, user, jsonMode) {
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    temperature: 0.2,
+    stream: false,
+  };
+  if (jsonMode) body.response_format = { type: 'json_object' };
+  const r = await fetch(`${cfg.lmstudio_host}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(() => '');
+    throw new Error(`lmstudio HTTP ${r.status}: ${txt.slice(0, 400)}`);
+  }
+  const d = await r.json();
+  return d.choices?.[0]?.message?.content ?? '';
+}
+
+async function chat(cfg, model, system, user, jsonMode = false) {
+  if (cfg.inference_provider === 'lmstudio') {
+    return chatLMStudio(cfg, model, system, user, jsonMode);
+  }
+  return chatOllama(cfg, model, system, user, jsonMode);
 }
 
 // ── prompts ─────────────────────────────────────────────────────────
@@ -341,24 +390,37 @@ async function doctor() {
     warn('final_review_provider=ollama — Claude final audit disabled (cross-file bugs may slip through)');
   }
 
-  console.log('\nOllama:');
+  const providerLabel = cfg.inference_provider === 'lmstudio' ? 'LM Studio' : 'Ollama';
+  console.log(`\nInference (${providerLabel}):`);
   let models = [];
   try {
-    models = await ollamaTags(cfg.ollama_host);
-    ok(`ollama running  ${cfg.ollama_host}`);
+    models = await listInferenceModels(cfg);
+    ok(`${cfg.inference_provider} running  ${inferenceLabel(cfg).split(' ')[1].slice(1, -1)}`);
   } catch (e) {
-    bad(`ollama unreachable at ${cfg.ollama_host} — start it with \`ollama serve\` or the Mac app`);
+    if (cfg.inference_provider === 'lmstudio') {
+      bad(`LM Studio unreachable at ${cfg.lmstudio_host} — open LM Studio → Developer tab → load a model → Start Server`);
+    } else {
+      bad(`ollama unreachable at ${cfg.ollama_host} — start it with \`ollama serve\` or the Mac app`);
+    }
   }
+  const pullHint = cfg.inference_provider === 'lmstudio'
+    ? `not loaded in LM Studio — load it via the Developer tab`
+    : (m) => `not pulled — \`ollama pull ${m}\``;
   const rolesToCheck = cfg.planner_provider === 'claude'
     ? [['coder (php)', 'coder_model_php'], ['coder (js)', 'coder_model_js'], ['reviewer', 'reviewer_model']]
     : [['planner', 'planner_model'], ['coder (php)', 'coder_model_php'], ['coder (js)', 'coder_model_js'], ['reviewer', 'reviewer_model']];
   for (const [label, key] of rolesToCheck) {
     const m = cfg[key];
-    models.includes(m) ? ok(`${label}: ${m}`) : bad(`${label}: ${m} not pulled — \`ollama pull ${m}\``);
+    if (models.includes(m)) {
+      ok(`${label}: ${m}`);
+    } else {
+      const hint = typeof pullHint === 'function' ? pullHint(m) : pullHint;
+      bad(`${label}: ${m} ${hint}`);
+    }
   }
   if (cfg.planner_provider === 'claude') {
     const m = cfg.planner_model;
-    models.includes(m) ? ok(`planner fallback: ${m}`) : warn(`planner fallback ${m} not pulled (only matters if claude CLI fails)`);
+    models.includes(m) ? ok(`planner fallback: ${m}`) : warn(`planner fallback ${m} not loaded (only matters if claude CLI fails)`);
   }
 
   console.log('\nGitHub:');
@@ -395,11 +457,24 @@ async function setup() {
     default: cfg.final_review_provider,
   });
 
-  cfg.ollama_host = await input({ message: 'Ollama host URL', default: cfg.ollama_host });
+  cfg.inference_provider = await select({
+    message: 'Local inference provider (where coder/reviewer/planner-fallback models run)',
+    choices: [
+      { name: 'ollama  — Ollama daemon, GGUF format, broadest model selection', value: 'ollama' },
+      { name: 'lmstudio  — LM Studio server, OpenAI-compatible, MLX format on Apple Silicon (faster)', value: 'lmstudio' },
+    ],
+    default: cfg.inference_provider,
+  });
+
+  if (cfg.inference_provider === 'lmstudio') {
+    cfg.lmstudio_host = await input({ message: 'LM Studio host URL', default: cfg.lmstudio_host });
+  } else {
+    cfg.ollama_host = await input({ message: 'Ollama host URL', default: cfg.ollama_host });
+  }
 
   let models = [];
-  try { models = await ollamaTags(cfg.ollama_host); }
-  catch { console.log('  (Ollama unreachable — manual entry)'); }
+  try { models = await listInferenceModels(cfg); }
+  catch { console.log(`  (${cfg.inference_provider} unreachable — manual entry)`); }
 
   const ask = async (label, key) => {
     if (models.length) {
@@ -435,10 +510,11 @@ async function modelsCmd() {
   const cfg = loadConfig();
   head('🤖 Models');
   console.log(`\nPlanner provider: ${c.bold}${cfg.planner_provider}${c.reset}${cfg.planner_provider === 'claude' ? `  ${c.dim}(fallback: ${cfg.planner_model})${c.reset}` : ''}`);
+  console.log(`Inference provider: ${c.bold}${cfg.inference_provider}${c.reset}  ${c.dim}(${inferenceLabel(cfg)})${c.reset}`);
   let list = [];
-  try { list = await ollamaTags(cfg.ollama_host); }
-  catch (e) { bad(`\nollama unreachable: ${e.message}`); return; }
-  console.log('\nOllama models:');
+  try { list = await listInferenceModels(cfg); }
+  catch (e) { bad(`\n${cfg.inference_provider} unreachable: ${e.message}`); return; }
+  console.log(`\n${cfg.inference_provider === 'lmstudio' ? 'LM Studio' : 'Ollama'} models:`);
   for (const m of list) {
     const roles = [];
     if (m === cfg.planner_model) roles.push(cfg.planner_provider === 'claude' ? 'planner-fallback' : 'planner');
@@ -466,7 +542,7 @@ async function planChat(cfg, system, user, role = 'planner') {
       }
     }
   }
-  const t0 = agentStart(role, 'ollama', cfg.planner_model);
+  const t0 = agentStart(role, cfg.inference_provider, cfg.planner_model);
   const out = await chat(cfg, cfg.planner_model, system, user, true);
   agentDone(t0, `${c.dim}(${out.length} chars)${c.reset}`);
   return out;
@@ -509,7 +585,7 @@ ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}`;
   prompt += `\n\nWrite the complete contents of ${file.path}.`;
 
   const coderModel = pickCoderModel(file.path, cfg);
-  const t0 = agentStart('coder', 'ollama', coderModel);
+  const t0 = agentStart('coder', cfg.inference_provider, coderModel);
   let content = await chat(cfg, coderModel, CODER_SYS, prompt);
   agentDone(t0, `${c.dim}(${content.length} chars)${c.reset}`);
   return stripFences(content);
@@ -529,7 +605,7 @@ ${'```'}
 
 Review this file for both per-file issues AND cross-file consistency with the already-generated siblings above. Output JSON only.`;
 
-  const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
+  const t0 = agentStart('reviewer', cfg.inference_provider, cfg.reviewer_model);
   const raw = await chat(cfg, cfg.reviewer_model, REVIEWER_SYS, prompt, true);
   agentDone(t0);
   return parseJson(raw);
@@ -914,7 +990,7 @@ program.command('ping').description('Send a tiny request to each agent and repor
     const [label, model] = coderTargets[i];
     console.log(`\n${c.bold}${2 + i}. ${label}${c.reset}`);
     try {
-      const t0 = agentStart(label, 'ollama', model);
+      const t0 = agentStart(label, cfg.inference_provider, model);
       const out = await chat(cfg, model, 'Reply with exactly: PONG', 'ping');
       agentDone(t0);
       /pong/i.test(out) ? ok(`${label} replied`) : warn(`${label} replied: ${out.slice(0, 80)}`);
@@ -923,7 +999,7 @@ program.command('ping').description('Send a tiny request to each agent and repor
 
   console.log(`\n${c.bold}${2 + coderTargets.length}. reviewer${c.reset}`);
   try {
-    const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
+    const t0 = agentStart('reviewer', cfg.inference_provider, cfg.reviewer_model);
     const raw = await chat(cfg, cfg.reviewer_model, 'Reply with the JSON {"ok":true} and nothing else.', 'ping', true);
     agentDone(t0);
     const parsed = parseJson(raw);
