@@ -750,10 +750,6 @@ async function buildCmd(request, opts = {}) {
     }
   }
 
-  if (!opts.yes) {
-    const proceed = await confirm({ message: 'Build this plugin?', default: true });
-    if (!proceed) return;
-  }
 
   const repoDir = cwdMode ? baseDir : join(baseDir, blueprint.plugin_slug);
   console.log(`\n   ${c.dim}→ ${repoDir}${c.reset}`);
@@ -940,7 +936,7 @@ program.command('setup').description('Interactive config').action(setup);
 program.command('models').description('List Ollama models and roles').action(modelsCmd);
 program.command('plan <request...>').description('Plan only, do not build').action((req) => planCmd(req.join(' ')));
 program.command('build <request...>')
-  .option('-y, --yes', 'auto-confirm all prompts (skip triage clarifications, accept build prompt, overwrite existing files)')
+  .option('-y, --yes', 'auto-confirm remaining prompts (skip triage clarifications, overwrite existing files without asking)')
   .description('Plan and build (drops plugin in current folder by default)')
   .option('--out <dir>', 'output to a specific directory (overrides config)')
   .action((req, opts) => buildCmd(req.join(' '), opts));
