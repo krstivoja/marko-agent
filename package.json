@@ -1,0 +1,23 @@
+{
+  "name": "marko-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.93.0",
+    "@inquirer/prompts": "^8.4.2",
+    "commander": "^14.0.3",
+    "ollama": "^0.6.3",
+    "simple-git": "^3.36.0"
+  },
+  "bin": {
+    "marko-agent": "./marko-agent.mjs"
+  }
+}
