@@ -18,10 +18,12 @@ const DEFAULTS = {
   ollama_host: 'http://localhost:11434',
   planner_provider: 'claude',
   planner_model: 'qwen3:8b',
-  coder_model: 'qwen3-coder:30b',
+  coder_model_php: 'qwen3-coder:30b',
+  coder_model_js: 'qwen3-coder:30b',
   reviewer_model: 'qwen3-coder:30b',
   out_dir: DEFAULT_OUT,
   max_review_rounds: 3,
+  max_final_review_rounds: 2,
   github_owner: '',
 };
 
@@ -50,8 +52,20 @@ function agentDone(t0, extra = '') {
 
 function loadConfig() {
   if (!existsSync(CONFIG_FILE)) return { ...DEFAULTS };
-  try { return { ...DEFAULTS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) }; }
-  catch { return { ...DEFAULTS }; }
+  try {
+    const stored = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+    // Backward compat: legacy single coder_model → use it as both PHP and JS coders
+    if (stored.coder_model && !stored.coder_model_php) stored.coder_model_php = stored.coder_model;
+    if (stored.coder_model && !stored.coder_model_js) stored.coder_model_js = stored.coder_model;
+    delete stored.coder_model;
+    return { ...DEFAULTS, ...stored };
+  } catch { return { ...DEFAULTS }; }
+}
+
+function pickCoderModel(filePath, cfg) {
+  const ext = (filePath.split('.').pop() || '').toLowerCase();
+  const frontend = new Set(['js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'css', 'scss', 'html', 'json']);
+  return frontend.has(ext) ? cfg.coder_model_js : cfg.coder_model_php;
 }
 
 function saveConfig(cfg) {
@@ -253,6 +267,36 @@ Output ONLY JSON:
 }
 approved=true means zero blocker/major issues.`;
 
+const FINAL_REVIEW_SYS = `You are a senior WordPress code auditor performing a final, holistic review of a complete plugin. You see ALL files at once and your job is to catch issues a per-file reviewer would miss.
+
+Audit for:
+- Cross-file consistency: hook names, AJAX action names, nonce action strings, wp_localize_script object names, localized property keys, DOM IDs/classes, POST field names, class names + constructor arity, callback method names, capability strings, constants. Mismatches between siblings = "blocker".
+- Security: escaping (esc_html/esc_attr/esc_url/wp_kses_post on ALL output incl. translated strings), sanitization with wp_unslash + appropriate sanitizer for every \$_POST/\$_GET/\$_REQUEST/\$_COOKIE/\$_SERVER read, nonce verification on state-changing endpoints, capability checks on settings pages and AJAX handlers, prepared statements for SQL.
+- WordPress Coding Standards: ABSPATH guard at top of every PHP file, complete plugin header (Plugin Name, Description, Version, Author, License GPLv2+, License URI, Text Domain, Domain Path, Requires at least, Requires PHP), text domain matching plugin slug, all user-facing strings translatable.
+- Modern JavaScript: flag jQuery usage and the \`jquery\` enqueue dependency unless the plugin truly integrates with a jQuery-only WP area; flag hardcoded user-facing strings (must come from localized i18n object); flag missing element existence guards.
+- Enqueueing: version argument present (not \`false\`), uses plugins_url(asset, \$main_plugin_file) or a defined PLUGIN_URL constant — flag any \`plugin_dir_url(__FILE__) . '../...'\`.
+- uninstall.php: only deletes options/transients/post_meta/CPT data the plugin actually creates — flag dead cleanup for keys never written; flag deprecated wp_get_sites() (must be get_sites()).
+- i18n: text domain literal matches plugin slug everywhere; no variable text domains.
+
+Severity vocabulary (must match these exact strings):
+- "blocker" — runtime breakage, security hole, or cross-file mismatch that breaks the plugin
+- "major" — clear standards violation or correctness issue that should block release
+- "minor" — style/convention nit
+- "info" — informational only
+
+Output ONLY JSON, no prose, no markdown:
+{
+  "approved": true|false,
+  "summary": "one-sentence overall assessment",
+  "files": [
+    { "path": "exact/file/path.php", "issues": [
+      { "severity": "blocker|major|minor|info", "category": "security|consistency|wpcs|correctness|i18n", "message": "specific, actionable description" }
+    ]}
+  ]
+}
+
+approved=true means zero blocker AND zero major issues across all files. Only include files that have at least one issue in the "files" array.`;
+
 // ── commands ────────────────────────────────────────────────────────
 async function doctor() {
   const cfg = loadConfig();
@@ -288,10 +332,12 @@ async function doctor() {
   } catch (e) {
     bad(`ollama unreachable at ${cfg.ollama_host} — start it with \`ollama serve\` or the Mac app`);
   }
-  const rolesToCheck = cfg.planner_provider === 'claude' ? ['coder', 'reviewer'] : ['planner', 'coder', 'reviewer'];
-  for (const role of rolesToCheck) {
-    const m = cfg[`${role}_model`];
-    models.includes(m) ? ok(`${role}: ${m}`) : bad(`${role}: ${m} not pulled — \`ollama pull ${m}\``);
+  const rolesToCheck = cfg.planner_provider === 'claude'
+    ? [['coder (php)', 'coder_model_php'], ['coder (js)', 'coder_model_js'], ['reviewer', 'reviewer_model']]
+    : [['planner', 'planner_model'], ['coder (php)', 'coder_model_php'], ['coder (js)', 'coder_model_js'], ['reviewer', 'reviewer_model']];
+  for (const [label, key] of rolesToCheck) {
+    const m = cfg[key];
+    models.includes(m) ? ok(`${label}: ${m}`) : bad(`${label}: ${m} not pulled — \`ollama pull ${m}\``);
   }
   if (cfg.planner_provider === 'claude') {
     const m = cfg.planner_model;
@@ -343,7 +389,8 @@ async function setup() {
     ? 'Planner fallback model (used if claude CLI fails)'
     : 'Planner model';
   await ask(plannerLabel, 'planner_model');
-  await ask('Coder model', 'coder_model');
+  await ask('Coder model — PHP (and readme.txt)', 'coder_model_php');
+  await ask('Coder model — JS / CSS / frontend', 'coder_model_js');
   await ask('Reviewer model', 'reviewer_model');
 
   cfg.out_dir = await input({
@@ -369,7 +416,8 @@ async function modelsCmd() {
   for (const m of list) {
     const roles = [];
     if (m === cfg.planner_model) roles.push(cfg.planner_provider === 'claude' ? 'planner-fallback' : 'planner');
-    if (m === cfg.coder_model) roles.push('coder');
+    if (m === cfg.coder_model_php) roles.push('coder:php');
+    if (m === cfg.coder_model_js) roles.push('coder:js');
     if (m === cfg.reviewer_model) roles.push('reviewer');
     console.log(`  ${m}${roles.length ? `  ${c.dim}[${roles.join(', ')}]${c.reset}` : ''}`);
   }
@@ -434,8 +482,9 @@ ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}`;
   }
   prompt += `\n\nWrite the complete contents of ${file.path}.`;
 
-  const t0 = agentStart('coder', 'ollama', cfg.coder_model);
-  let content = await chat(cfg, cfg.coder_model, CODER_SYS, prompt);
+  const coderModel = pickCoderModel(file.path, cfg);
+  const t0 = agentStart('coder', 'ollama', coderModel);
+  let content = await chat(cfg, coderModel, CODER_SYS, prompt);
   agentDone(t0, `${c.dim}(${content.length} chars)${c.reset}`);
   return stripFences(content);
 }
@@ -467,16 +516,164 @@ function phpLint(content, path) {
   return { ok: false, error: (r.stderr || r.stdout || '').trim() };
 }
 
-async function planCmd(request) {
+function compressForReview(content) {
+  return content
+    .split('\n')
+    .map(l => l.replace(/[ \t]+$/, ''))
+    .filter((l, i, arr) => !(l === '' && arr[i - 1] === ''))
+    .join('\n')
+    .trim();
+}
+
+function shouldAuditPath(filePath) {
+  const lower = filePath.toLowerCase();
+  if (lower.endsWith('readme.txt')) return false;
+  return true;
+}
+
+function formatAuditedFiles(generatedFiles, changedPaths) {
+  const audited = [];
+  const unchanged = [];
+  for (const [path, content] of generatedFiles) {
+    if (!shouldAuditPath(path)) continue;
+    if (changedPaths && !changedPaths.has(path)) {
+      unchanged.push(path);
+    } else {
+      audited.push(`=== ${path} ===\n${compressForReview(content)}`);
+    }
+  }
+  let out = audited.join('\n\n');
+  if (unchanged.length) {
+    out += `\n\n=== UNCHANGED FROM YOUR PRIOR APPROVAL ===\nThe following files have identical content to what you reviewed last round. Re-check only that the regenerated files above remain consistent with their cross-file references into these:\n${unchanged.map(p => `  - ${p}`).join('\n')}`;
+  }
+  return out;
+}
+
+function claudeFinalReview(cfg, blueprint, generatedFiles, changedPaths) {
+  const isFirstPass = !changedPaths;
+  const header = isFirstPass
+    ? 'ALL GENERATED FILES (audit holistically — flag cross-file mismatches, security gaps, WPCS violations):'
+    : 'REGENERATED FILES from this round (re-audit these; siblings listed at the bottom are unchanged from your prior approval):';
+
+  const prompt = `Plugin: ${blueprint.plugin_name} (slug: ${blueprint.plugin_slug})
+Description: ${blueprint.description}
+
+File manifest:
+${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}
+
+${header}
+
+${formatAuditedFiles(generatedFiles, changedPaths)}
+
+Return your audit as JSON only.`;
+
+  const t0 = agentStart('final-review', 'claude');
+  let raw;
+  try {
+    raw = claudeChat(FINAL_REVIEW_SYS, prompt);
+  } catch (e) {
+    agentDone(t0, `${c.red}failed${c.reset}`);
+    throw e;
+  }
+  agentDone(t0, `${c.dim}(${raw.length} chars)${c.reset}`);
+  return parseJson(raw);
+}
+
+async function runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles) {
+  if (cfg.planner_provider !== 'claude') return;
+  if (!claudeAvailable()) {
+    warn(`claude CLI not found — skipping final review`);
+    return;
+  }
+
+  const fileByPath = new Map(blueprint.files.map(f => [f.path, f]));
+  const maxRounds = cfg.max_final_review_rounds ?? 2;
+  let lastReport = null;
+  let changedPaths = null; // null = first pass, send everything
+
+  for (let round = 1; round <= maxRounds; round++) {
+    let report;
+    try {
+      report = claudeFinalReview(cfg, blueprint, generatedFiles, changedPaths);
+    } catch (e) {
+      console.log(`   ${c.yellow}final review failed (${e.message.split('\n')[0]}) — skipping remaining rounds${c.reset}`);
+      return;
+    }
+    lastReport = report;
+
+    if (report.approved) {
+      console.log(`   ${c.green}✅ Claude final review: approved (round ${round})${c.reset}`);
+      if (report.summary) console.log(`   ${c.dim}${report.summary}${c.reset}`);
+      return;
+    }
+
+    const fileReports = (report.files || []).filter(f =>
+      (f.issues || []).some(i => i.severity === 'blocker' || i.severity === 'major')
+    );
+
+    console.log(`   ${c.yellow}🔁 round ${round}: ${fileReports.length} file(s) need fixes${c.reset}`);
+    if (report.summary) console.log(`   ${c.dim}${report.summary}${c.reset}`);
+    for (const fr of fileReports) {
+      console.log(`   ${c.bold}${fr.path}${c.reset}`);
+      for (const i of fr.issues || []) {
+        if (i.severity === 'blocker' || i.severity === 'major') {
+          console.log(`      [${i.severity}/${i.category}] ${i.message}`);
+        }
+      }
+    }
+
+    if (round === maxRounds) break;
+
+    const regenerated = new Set();
+    for (const fr of fileReports) {
+      const file = fileByPath.get(fr.path);
+      if (!file) {
+        console.log(`   ${c.yellow}skip ${fr.path} — not in blueprint${c.reset}`);
+        continue;
+      }
+      const blockingIssues = (fr.issues || []).filter(i => i.severity === 'blocker' || i.severity === 'major');
+      const prev = generatedFiles.get(fr.path) || '';
+
+      const fixed = await generateFile(cfg, blueprint, file, prev, blockingIssues, generatedFiles);
+
+      const lint = phpLint(fixed, fr.path);
+      if (!lint.ok) {
+        const firstLine = lint.error.split('\n')[0];
+        console.log(`   ${c.yellow}php -l failed on regenerated ${fr.path} — keeping previous draft this round${c.reset}`);
+        console.log(`      ${c.dim}${firstLine}${c.reset}`);
+        continue;
+      }
+
+      const dest = join(repoDir, fr.path);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, fixed);
+      generatedFiles.set(fr.path, fixed);
+      regenerated.add(fr.path);
+    }
+    changedPaths = regenerated;
+  }
+
+  if (lastReport && !lastReport.approved) {
+    const reportPath = join(repoDir, 'claude-final-review.json');
+    writeFileSync(reportPath, JSON.stringify(lastReport, null, 2));
+    warn(`final review unresolved after ${maxRounds} rounds — residual issues in ${reportPath}`);
+  }
+}
+
+async function planCmd(request, opts = {}) {
   const cfg = loadConfig();
   console.log(`${c.cyan}🧠 Triaging...${c.reset}\n`);
   const t = await triage(cfg, request);
   let finalReq = request;
   if (t.need_clarification && t.questions?.length) {
-    console.log('Need to clarify before planning:\n');
-    for (const q of t.questions) {
-      const a = await input({ message: q });
-      finalReq += `\n\nQ: ${q}\nA: ${a}`;
+    if (opts.yes) {
+      console.log(`${c.dim}(--yes) skipping ${t.questions.length} triage question(s); proceeding with original request${c.reset}\n`);
+    } else {
+      console.log('Need to clarify before planning:\n');
+      for (const q of t.questions) {
+        const a = await input({ message: q });
+        finalReq += `\n\nQ: ${q}\nA: ${a}`;
+      }
     }
   }
   console.log(`\n${c.cyan}📐 Planning...${c.reset}\n`);
@@ -516,7 +713,7 @@ async function buildCmd(request, opts = {}) {
     augmentedRequest = `${request}\n\nCONSTRAINT: The plugin slug MUST be exactly "${forcedSlug}". The main PHP file MUST be named "${forcedSlug}.php". Use this slug as the text domain.`;
   }
 
-  const { blueprint } = await planCmd(augmentedRequest);
+  const { blueprint } = await planCmd(augmentedRequest, opts);
 
   // Belt-and-suspenders: force the slug + main filename even if planner ignored the constraint
   if (forcedSlug && blueprint.plugin_slug !== forcedSlug) {
@@ -527,8 +724,10 @@ async function buildCmd(request, opts = {}) {
     }
   }
 
-  const proceed = await confirm({ message: 'Build this plugin?', default: true });
-  if (!proceed) return;
+  if (!opts.yes) {
+    const proceed = await confirm({ message: 'Build this plugin?', default: true });
+    if (!proceed) return;
+  }
 
   const repoDir = cwdMode ? baseDir : join(baseDir, blueprint.plugin_slug);
   console.log(`\n   ${c.dim}→ ${repoDir}${c.reset}`);
@@ -536,15 +735,23 @@ async function buildCmd(request, opts = {}) {
   if (cwdMode) {
     const conflicts = readdirSync(repoDir).filter(f => !f.startsWith('.') && f !== 'node_modules');
     if (conflicts.length) {
-      const overwrite = await confirm({
-        message: `${repoDir} is not empty (${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? '…' : ''}). Existing files may be overwritten. Continue?`,
-        default: false,
-      });
-      if (!overwrite) return;
+      if (opts.yes) {
+        console.log(`${c.dim}(--yes) overwriting non-empty ${repoDir} (${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? '…' : ''})${c.reset}`);
+      } else {
+        const overwrite = await confirm({
+          message: `${repoDir} is not empty (${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? '…' : ''}). Existing files may be overwritten. Continue?`,
+          default: false,
+        });
+        if (!overwrite) return;
+      }
     }
   } else if (existsSync(repoDir)) {
-    const overwrite = await confirm({ message: `${repoDir} exists. Overwrite?`, default: false });
-    if (!overwrite) return;
+    if (opts.yes) {
+      console.log(`${c.dim}(--yes) overwriting ${repoDir}${c.reset}`);
+    } else {
+      const overwrite = await confirm({ message: `${repoDir} exists. Overwrite?`, default: false });
+      if (!overwrite) return;
+    }
   }
   mkdirSync(repoDir, { recursive: true });
 
@@ -587,6 +794,11 @@ async function buildCmd(request, opts = {}) {
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, content);
     generatedFiles.set(file.path, content);
+  }
+
+  if (cfg.planner_provider === 'claude') {
+    console.log(`\n${c.cyan}🔎 Final Claude review...${c.reset}`);
+    await runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles);
   }
 
   console.log(`\n${c.cyan}📦 Setting up local git...${c.reset}`);
@@ -673,15 +885,21 @@ program.command('ping').description('Send a tiny request to each agent and repor
     parsed.ok ? ok(`planner replied in ${((Date.now() - t0) / 1000).toFixed(1)}s`) : bad(`unexpected reply: ${raw.slice(0, 100)}`);
   } catch (e) { bad(`planner failed: ${e.message}`); }
 
-  console.log(`\n${c.bold}2. coder${c.reset}`);
-  try {
-    const t0 = agentStart('coder', 'ollama', cfg.coder_model);
-    const out = await chat(cfg, cfg.coder_model, 'Reply with exactly: PONG', 'ping');
-    agentDone(t0);
-    /pong/i.test(out) ? ok(`coder replied`) : warn(`coder replied: ${out.slice(0, 80)}`);
-  } catch (e) { bad(`coder failed: ${e.message}`); }
+  const coderTargets = cfg.coder_model_php === cfg.coder_model_js
+    ? [['coder (php+js)', cfg.coder_model_php]]
+    : [['coder (php)', cfg.coder_model_php], ['coder (js)', cfg.coder_model_js]];
+  for (let i = 0; i < coderTargets.length; i++) {
+    const [label, model] = coderTargets[i];
+    console.log(`\n${c.bold}${2 + i}. ${label}${c.reset}`);
+    try {
+      const t0 = agentStart(label, 'ollama', model);
+      const out = await chat(cfg, model, 'Reply with exactly: PONG', 'ping');
+      agentDone(t0);
+      /pong/i.test(out) ? ok(`${label} replied`) : warn(`${label} replied: ${out.slice(0, 80)}`);
+    } catch (e) { bad(`${label} failed: ${e.message}`); }
+  }
 
-  console.log(`\n${c.bold}3. reviewer${c.reset}`);
+  console.log(`\n${c.bold}${2 + coderTargets.length}. reviewer${c.reset}`);
   try {
     const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
     const raw = await chat(cfg, cfg.reviewer_model, 'Reply with the JSON {"ok":true} and nothing else.', 'ping', true);
@@ -696,6 +914,7 @@ program.command('setup').description('Interactive config').action(setup);
 program.command('models').description('List Ollama models and roles').action(modelsCmd);
 program.command('plan <request...>').description('Plan only, do not build').action((req) => planCmd(req.join(' ')));
 program.command('build <request...>')
+  .option('-y, --yes', 'auto-confirm all prompts (skip triage clarifications, accept build prompt, overwrite existing files)')
   .description('Plan and build (drops plugin in current folder by default)')
   .option('--out <dir>', 'output to a specific directory (overrides config)')
   .action((req, opts) => buildCmd(req.join(' '), opts));
