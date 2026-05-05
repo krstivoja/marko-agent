@@ -7,6 +7,7 @@ import { execSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
 const CONFIG_DIR = join(HOME, '.marko-agent');
@@ -144,40 +145,69 @@ Rules:
 - Always include readme.txt
 - 3–8 files unless complexity demands more
 - All user-facing strings translatable
-- ORDER FILES BY DEPENDENCY: files later in the list will be generated with full visibility into the contents of earlier files. Put files that DEFINE shared identifiers (IDs, hook names, localized object keys, nonce actions, AJAX action names, class signatures) BEFORE files that CONSUME those identifiers. Recommended order:
+- Modern JS by default — do NOT plan an admin.js with jQuery dependency unless the plugin must integrate with classic widgets/Customizer
+- Only include uninstall.php when the plugin actually creates persistent data (options, transients, post meta, custom tables). Don't add it just for symmetry.
+- ORDER FILES BY DEPENDENCY: files later in the list are generated with full visibility into earlier files. Put files that DEFINE shared identifiers (IDs, hook names, localized object keys, nonce actions, AJAX action names, class signatures) BEFORE files that CONSUME them. Recommended order:
   1. Main plugin .php file (defines constants, instantiates classes)
-  2. PHP class/include files (define hooks, render HTML with IDs, register AJAX actions, call wp_localize_script)
+  2. PHP class/include files (define hooks, render HTML with IDs, register AJAX, call wp_localize_script)
   3. JS files (consume DOM IDs, localized object keys, AJAX action names from above)
   4. CSS files
-  5. uninstall.php
+  5. uninstall.php (only if needed)
   6. readme.txt
 - Output ONLY JSON, no prose.`;
 
-const CODER_SYS = `You are a senior WordPress developer. Write production-ready code following WordPress Coding Standards.
+const CODER_SYS = `You are a senior WordPress developer. Write production-ready code following WordPress Coding Standards (WPCS).
 
-Required:
-- ABSPATH guard at top of every PHP file
-- Escape all output (esc_html, esc_attr, esc_url, wp_kses_post)
-- Sanitize all input (sanitize_text_field, etc.)
-- Verify nonces on state-changing actions
-- Check capabilities (current_user_can)
-- Translatable strings with text domain matching plugin slug
-- Proper plugin header in main file
+PHP — security and standards:
+- ABSPATH guard at top of every PHP file: \`if ( ! defined( 'ABSPATH' ) ) { exit; }\`
+- Plugin header in main file: Plugin Name, Description, Version, Author, License (GPLv2+), License URI, Text Domain, Domain Path, Requires at least, Requires PHP
+- Escape ALL output: esc_html, esc_attr, esc_url, esc_textarea, wp_kses_post — including translated strings (esc_html__, esc_html_e, esc_attr__)
+- Sanitize ALL input from \$_GET/\$_POST/\$_REQUEST/\$_COOKIE/\$_SERVER. Always use this idiom for $_POST/$_GET reads:
+    isset( \$_POST['key'] ) ? sanitize_text_field( wp_unslash( \$_POST['key'] ) ) : ''
+  Use \`sanitize_textarea_field\` for multi-line, \`sanitize_key\` for slugs/keys/nonces, \`absint\` for ints, \`esc_url_raw\` for URLs.
+- Nonce verification idiom:
+    if ( ! isset( \$_POST['nonce'] ) || ! wp_verify_nonce( sanitize_key( wp_unslash( \$_POST['nonce'] ) ), 'action_name' ) ) { wp_send_json_error( ..., 403 ); }
+- Capability check on state-changing endpoints AND on settings page render
+- All user-facing strings translatable with text domain matching plugin slug
+- Use prepared statements (\$wpdb->prepare) — never interpolate $_POST into SQL
+- No \`extract()\`, no \`eval()\`, no \`include\` of user input
+- Type-hint method signatures where reasonable (PHP 7.4+): \`public function foo( string \$bar ): void\`
+- Use early returns for guard clauses, not nested ifs
+
+JavaScript — modern, no jQuery:
+- Use VANILLA JS. Do NOT use jQuery, do NOT add \`jquery\` as enqueue dependency unless the plugin truly integrates with jQuery-only WP areas (Customizer, classic widgets).
+- Use \`document.querySelector\`, \`addEventListener('input', ...)\`, \`fetch()\` with FormData for AJAX.
+- Wrap in IIFE \`(function() { 'use strict'; ... })();\`. No globals beyond the wp_localize_script object.
+- Bind only when target elements exist (\`if ( ! el ) return;\`).
+- All user-facing strings come from the localized object (e.g. \`test3Data.i18n.error\`) — do NOT hardcode "Error" in JS.
+- Debounce expensive AJAX with a small \`debounce()\` helper.
+
+Enqueueing assets:
+- Use \`plugins_url( 'assets/js/admin.js', \$main_plugin_file )\` or define a \`PLUGIN_URL\` constant in the main file. Do NOT use \`plugin_dir_url(__FILE__) . '../assets/...'\` — the \`..\` segment is ugly and brittle.
+- Always pass a version (use the plugin version constant, not 'false') to bust caches on update.
+- Pass \`true\` for \`in_footer\` on JS unless there's a reason not to.
+- Bail early in enqueue callbacks if hook suffix doesn't match the plugin's page.
+
+readme.txt:
+- Standard WP.org format: === Plugin Name ===, Contributors, Tags, Requires at least, Tested up to, Stable tag, License, License URI, then == Description ==, == Installation ==, == Frequently Asked Questions ==, == Changelog ==.
+
+uninstall.php:
+- Only delete options/transients/post_meta/CPT data the plugin actually creates. Do NOT include placeholder cleanup for data that's never written.
+- Multisite: use \`get_sites()\` and \`switch_to_blog()\`. Do NOT use deprecated \`wp_get_sites()\`.
 
 CROSS-FILE CONSISTENCY (CRITICAL):
-When already-generated files are provided as context, you MUST use the EXACT SAME identifiers across files. Do NOT invent new ones. Specifically:
-- DOM element IDs and CSS classes (must match what JS targets and what PHP renders)
-- wp_localize_script object names (the JS-side variable name must match what JS reads)
-- Localized object property keys (e.g. ajax_url vs ajaxurl, nonce key, strings, etc.)
-- AJAX action names (wp_ajax_<action> hook must match the action sent in JS POST)
-- Nonce action names (wp_create_nonce / wp_verify_nonce must use the same string)
-- POST field names (the JS sender's keys must match what the PHP handler reads from $_POST)
-- Class names, constructor signatures, and how they're instantiated
+When already-generated files are provided as context, you MUST reuse their EXACT identifiers. Do NOT invent new ones. Specifically:
+- DOM IDs/classes (must match between PHP-rendered HTML and JS selectors)
+- wp_localize_script object names (the JS-side variable must match)
+- Localized property keys (ajax_url vs ajaxurl — pick whatever the prior file used)
+- AJAX action names (wp_ajax_<action> hook = action field in JS POST)
+- Nonce action strings (wp_create_nonce / wp_verify_nonce must use the same literal)
+- POST field names (JS keys = $_POST reads)
+- Class names, constructor signatures, instantiation arity
 - Hook callback method names
-- Constant names defined in the main file
-- Capability strings used in add_*_page and current_user_can checks
-
-If an already-generated file requires a constructor argument, the file that instantiates it MUST pass the right arguments. If a class defines define_admin_hooks(), the bootstrapping file MUST call it.
+- Constants defined in the main file (TEST_3_AJAX_ACTION, etc.) — reference them, don't redeclare
+- Capability strings (e.g. 'manage_options') agree between add_*_page and current_user_can
+- If a class exposes init() or define_admin_hooks(), the bootstrap MUST call it
 
 Output ONLY the file contents. No markdown fences. No prose. No explanation.`;
 
@@ -185,19 +215,32 @@ const REVIEWER_SYS = `You are a strict WordPress code reviewer.
 
 Per-file checks:
 - Security: nonces, capability checks, sanitization, escaping, SQL injection
-- Correctness: hook signatures, syntax, name collisions, deprecated functions
-- Standards: text domain, ABSPATH guard, WP API usage
+- $_POST/$_GET reads MUST use \`wp_unslash()\` AND an appropriate sanitizer (sanitize_key for nonces/keys, sanitize_text_field for short text, sanitize_textarea_field for multi-line, absint for ints, esc_url_raw for URLs). Reading \`\$_POST['nonce']\` directly without wp_unslash + sanitize_key is a MAJOR issue.
+- Correctness: hook signatures, syntax, name collisions, deprecated functions (wp_get_sites, get_currentuserinfo, get_userdatabylogin, etc.)
+- Standards: text domain, ABSPATH guard, plugin header completeness (Author, License, License URI, Text Domain, Requires at least, Requires PHP)
 
-CROSS-FILE consistency checks (when already-generated files are provided as context):
+JavaScript checks:
+- Flag jQuery usage (e.g. \`(function($) { ... })(jQuery);\`, \`$.post\`, \`$()\`) as MAJOR unless the plugin explicitly integrates with a jQuery-only WP area. Modern plugins should use vanilla JS (\`document.querySelector\`, \`addEventListener\`, \`fetch\`).
+- Flag hardcoded user-facing strings in JS (e.g. \`textContent = 'Error'\`) — they should come from the localized i18n object.
+- Flag missing element existence guards before binding listeners.
+
+Enqueue checks:
+- Flag \`plugin_dir_url(__FILE__) . '../...'\` as MINOR — should use \`plugins_url('asset', \$main_plugin_file)\` or a defined PLUGIN_URL constant.
+- Flag missing version argument (or \`false\`) — caches won't bust on update.
+
+uninstall.php checks:
+- Flag delete_option/delete_transient calls for keys the plugin never actually sets — that's dead code.
+- Flag use of deprecated \`wp_get_sites()\` — should be \`get_sites()\`.
+
+CROSS-FILE consistency checks (when already-generated files are provided):
 - Do DOM IDs/classes referenced in this file exist in the rendered HTML of sibling files?
 - Does any wp_localize_script object name in a sibling file match the global this file reads?
-- Do localized object property keys agree (ajax_url vs ajaxurl, nonce key, etc.)?
+- Do localized property keys agree (ajax_url vs ajaxurl, nonce key, etc.)?
 - Do AJAX action names match between JS sender and PHP wp_ajax_ hook?
 - Do nonce action strings agree across wp_create_nonce / wp_verify_nonce calls?
 - Do POST field names sent by JS match what PHP reads from $_POST?
 - Do class instantiations pass the right number of constructor arguments?
-- Are referenced methods actually called (e.g. define_admin_hooks() exists but never invoked)?
-- Are deprecated WP functions used (wp_get_sites, get_currentuserinfo, etc.)?
+- Are referenced methods actually called (e.g. init() defined but never invoked)?
 
 Mark cross-file mismatches as severity "blocker" — they break the plugin at runtime.
 
@@ -659,6 +702,14 @@ program.command('build <request...>')
 program.command('list').description('List built plugins').action(listCmd);
 program.command('push <slug>').description('Push to GitHub and open PR').action(pushCmd);
 program.command('config [action] [key] [value]').description('Show or set config').action(configCmd);
+program.command('prompts').description('Print the current system prompts (to fine-tune, edit them in marko-agent.mjs)').action(() => {
+  const file = fileURLToPath(import.meta.url);
+  console.log(`${c.bold}Edit prompts in:${c.reset} ${file}\n`);
+  console.log(`${c.bold}${c.cyan}── TRIAGE_SYS ──${c.reset}\n${TRIAGE_SYS}\n`);
+  console.log(`${c.bold}${c.cyan}── PLAN_SYS ──${c.reset}\n${PLAN_SYS}\n`);
+  console.log(`${c.bold}${c.cyan}── CODER_SYS ──${c.reset}\n${CODER_SYS}\n`);
+  console.log(`${c.bold}${c.cyan}── REVIEWER_SYS ──${c.reset}\n${REVIEWER_SYS}\n`);
+});
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(`\n${c.red}✗${c.reset} ${err.message}`);
