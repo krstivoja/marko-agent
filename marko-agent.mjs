@@ -171,7 +171,19 @@ async function chatLMStudio(cfg, model, system, user, jsonMode) {
     temperature: 0.2,
     stream: false,
   };
-  if (jsonMode) body.response_format = { type: 'json_object' };
+  // LM Studio rejects `json_object`; only `json_schema` or `text` are accepted.
+  // Use a permissive any-object schema when jsonMode is on so the runtime
+  // enforces structure without us pre-declaring fields.
+  if (jsonMode) {
+    body.response_format = {
+      type: 'json_schema',
+      json_schema: {
+        name: 'response',
+        strict: false,
+        schema: { type: 'object', additionalProperties: true },
+      },
+    };
+  }
   const r = await fetch(`${cfg.lmstudio_host}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
