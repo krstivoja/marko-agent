@@ -275,6 +275,14 @@ Enqueueing assets:
 - Pass \`true\` for \`in_footer\` on JS unless there's a reason not to.
 - Bail early in enqueue callbacks if hook suffix doesn't match the plugin's page.
 
+Asset folder convention (REQUIRED):
+- Static assets MUST live under \`assets/css/\` and \`assets/js/\` at the plugin root. Never \`css/\` or \`js/\` directly at the root, never \`includes/assets/\`, never \`admin/css/\`. The blueprint's file paths are authoritative — match them exactly.
+
+WordPress text-handling idioms:
+- When counting words via \`str_word_count(\$text)\`, ALWAYS pre-process input through \`wp_strip_all_tags(\$text)\` first. Raw HTML in the input would otherwise count tags as words. Pattern: \`str_word_count( wp_strip_all_tags( \$text ) )\`.
+- For multi-line/markdown-ish text, prefer \`sanitize_textarea_field\` over \`sanitize_text_field\` (preserves newlines).
+- For HTML-allowed user content, use \`wp_kses_post\` (rich) or \`wp_kses\` with an explicit allowlist, not \`strip_tags\` (PHP native — leaves script/style content).
+
 readme.txt:
 - Standard WP.org format: === Plugin Name ===, Contributors, Tags, Requires at least, Tested up to, Stable tag, License, License URI, then == Description ==, == Installation ==, == Frequently Asked Questions ==, == Changelog ==.
 
