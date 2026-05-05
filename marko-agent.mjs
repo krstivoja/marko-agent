@@ -6,15 +6,16 @@ import { simpleGit } from 'simple-git';
 import { execSync, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 
 const HOME = homedir();
 const CONFIG_DIR = join(HOME, '.marko-agent');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
-const DEFAULT_OUT = join(HOME, 'Local Sites', 'marko-agent', 'out');
+const DEFAULT_OUT = '';
 
 const DEFAULTS = {
   ollama_host: 'http://localhost:11434',
+  planner_provider: 'claude',
   planner_model: 'qwen3:8b',
   coder_model: 'qwen3-coder:30b',
   reviewer_model: 'qwen3-coder:30b',
@@ -32,6 +33,19 @@ const ok = (m) => console.log(`  ${c.green}✓${c.reset} ${m}`);
 const bad = (m) => console.log(`  ${c.red}✗${c.reset} ${m}`);
 const warn = (m) => console.log(`  ${c.yellow}!${c.reset} ${m}`);
 const head = (m) => console.log(`\n${c.bold}${m}${c.reset}`);
+
+const VERBOSE = process.env.MARKO_VERBOSE === '1' || process.argv.includes('--verbose');
+
+function agentStart(role, provider, model) {
+  const tag = `[${role}→${provider}${model ? `:${model}` : ''}]`;
+  process.stdout.write(`   ${c.dim}${tag} thinking…${c.reset}`);
+  return Date.now();
+}
+function agentDone(t0, extra = '') {
+  const ms = Date.now() - t0;
+  process.stdout.write(`\r${' '.repeat(80)}\r`);
+  console.log(`   ${c.dim}└─ done in ${(ms / 1000).toFixed(1)}s${extra ? '  ' + extra : ''}${c.reset}`);
+}
 
 function loadConfig() {
   if (!existsSync(CONFIG_FILE)) return { ...DEFAULTS };
@@ -67,6 +81,26 @@ function parseJson(t) {
   const i = s.indexOf('{'), j = s.lastIndexOf('}');
   if (i >= 0 && j > i) s = s.slice(i, j + 1);
   return JSON.parse(s);
+}
+
+function claudeAvailable() {
+  return tryExec('command -v claude') !== null;
+}
+
+function claudeChat(system, user) {
+  const r = spawnSync(
+    'claude',
+    ['-p', user, '--output-format', 'json', '--append-system-prompt', system],
+    { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
+  );
+  if (r.status !== 0) {
+    throw new Error(`claude exited ${r.status}: ${(r.stderr || r.stdout || '').slice(0, 400)}`);
+  }
+  let wrapper;
+  try { wrapper = JSON.parse(r.stdout); }
+  catch (e) { throw new Error(`claude returned non-JSON: ${r.stdout.slice(0, 400)}`); }
+  if (wrapper.is_error) throw new Error(`claude error: ${wrapper.result || 'unknown'}`);
+  return wrapper.result;
 }
 
 async function chat(cfg, model, system, user, jsonMode = false) {
@@ -153,6 +187,18 @@ async function doctor() {
   const gh = tryExec('gh --version');
   gh ? ok(`gh  ${gh.split('\n')[0]}`) : warn('gh missing (only needed for `push`)');
 
+  console.log('\nPlanner:');
+  if (cfg.planner_provider === 'claude') {
+    if (claudeAvailable()) {
+      const v = tryExec('claude --version') || 'claude';
+      ok(`claude CLI  ${v}  (uses your Claude subscription)`);
+    } else {
+      bad(`planner_provider=claude but \`claude\` CLI not on PATH — install Claude Code or run \`marko-agent config set planner_provider ollama\``);
+    }
+  } else {
+    ok(`provider: ollama (model: ${cfg.planner_model})`);
+  }
+
   console.log('\nOllama:');
   let models = [];
   try {
@@ -161,9 +207,14 @@ async function doctor() {
   } catch (e) {
     bad(`ollama unreachable at ${cfg.ollama_host} — start it with \`ollama serve\` or the Mac app`);
   }
-  for (const role of ['planner', 'coder', 'reviewer']) {
+  const rolesToCheck = cfg.planner_provider === 'claude' ? ['coder', 'reviewer'] : ['planner', 'coder', 'reviewer'];
+  for (const role of rolesToCheck) {
     const m = cfg[`${role}_model`];
     models.includes(m) ? ok(`${role}: ${m}`) : bad(`${role}: ${m} not pulled — \`ollama pull ${m}\``);
+  }
+  if (cfg.planner_provider === 'claude') {
+    const m = cfg.planner_model;
+    models.includes(m) ? ok(`planner fallback: ${m}`) : warn(`planner fallback ${m} not pulled (only matters if claude CLI fails)`);
   }
 
   console.log('\nGitHub:');
@@ -181,6 +232,16 @@ async function setup() {
   const cfg = loadConfig();
   head('⚙️  Setup');
 
+  const claudeOk = claudeAvailable();
+  cfg.planner_provider = await select({
+    message: 'Planner (the "thinking" model that triages and plans)',
+    choices: [
+      { name: `claude  — uses your Claude subscription via \`claude\` CLI${claudeOk ? '' : '  (CLI not detected!)'}`, value: 'claude' },
+      { name: 'ollama  — fully local, uses an Ollama model', value: 'ollama' },
+    ],
+    default: cfg.planner_provider,
+  });
+
   cfg.ollama_host = await input({ message: 'Ollama host URL', default: cfg.ollama_host });
 
   let models = [];
@@ -197,11 +258,17 @@ async function setup() {
     }
   };
 
-  await ask('Planner model', 'planner_model');
+  const plannerLabel = cfg.planner_provider === 'claude'
+    ? 'Planner fallback model (used if claude CLI fails)'
+    : 'Planner model';
+  await ask(plannerLabel, 'planner_model');
   await ask('Coder model', 'coder_model');
   await ask('Reviewer model', 'reviewer_model');
 
-  cfg.out_dir = await input({ message: 'Output directory', default: cfg.out_dir });
+  cfg.out_dir = await input({
+    message: 'Default output directory (blank = current folder when build runs)',
+    default: cfg.out_dir,
+  });
   const rounds = await input({ message: 'Max review rounds per file', default: String(cfg.max_review_rounds) });
   cfg.max_review_rounds = parseInt(rounds) || 3;
   cfg.github_owner = await input({ message: 'GitHub owner/org for `push` (blank to skip)', default: cfg.github_owner });
@@ -213,13 +280,14 @@ async function setup() {
 async function modelsCmd() {
   const cfg = loadConfig();
   head('🤖 Models');
+  console.log(`\nPlanner provider: ${c.bold}${cfg.planner_provider}${c.reset}${cfg.planner_provider === 'claude' ? `  ${c.dim}(fallback: ${cfg.planner_model})${c.reset}` : ''}`);
   let list = [];
   try { list = await ollamaTags(cfg.ollama_host); }
-  catch (e) { bad(`ollama unreachable: ${e.message}`); return; }
-  console.log();
+  catch (e) { bad(`\nollama unreachable: ${e.message}`); return; }
+  console.log('\nOllama models:');
   for (const m of list) {
     const roles = [];
-    if (m === cfg.planner_model) roles.push('planner');
+    if (m === cfg.planner_model) roles.push(cfg.planner_provider === 'claude' ? 'planner-fallback' : 'planner');
     if (m === cfg.coder_model) roles.push('coder');
     if (m === cfg.reviewer_model) roles.push('reviewer');
     console.log(`  ${m}${roles.length ? `  ${c.dim}[${roles.join(', ')}]${c.reset}` : ''}`);
@@ -227,13 +295,35 @@ async function modelsCmd() {
   console.log();
 }
 
+async function planChat(cfg, system, user, role = 'planner') {
+  if (cfg.planner_provider === 'claude') {
+    if (!claudeAvailable()) {
+      console.log(`   ${c.yellow}claude CLI not found, falling back to ${cfg.planner_model}${c.reset}`);
+    } else {
+      const t0 = agentStart(role, 'claude');
+      try {
+        const out = claudeChat(system, user);
+        agentDone(t0, `${c.dim}(${out.length} chars)${c.reset}`);
+        return out;
+      } catch (e) {
+        agentDone(t0, `${c.red}failed${c.reset}`);
+        console.log(`   ${c.yellow}claude failed (${e.message.split('\n')[0]}), falling back to ${cfg.planner_model}${c.reset}`);
+      }
+    }
+  }
+  const t0 = agentStart(role, 'ollama', cfg.planner_model);
+  const out = await chat(cfg, cfg.planner_model, system, user, true);
+  agentDone(t0, `${c.dim}(${out.length} chars)${c.reset}`);
+  return out;
+}
+
 async function triage(cfg, request) {
-  const raw = await chat(cfg, cfg.planner_model, TRIAGE_SYS, request, true);
+  const raw = await planChat(cfg, TRIAGE_SYS, request, 'triage');
   return parseJson(raw);
 }
 
 async function planRequest(cfg, request) {
-  const raw = await chat(cfg, cfg.planner_model, PLAN_SYS, request, true);
+  const raw = await planChat(cfg, PLAN_SYS, request, 'planner');
   return parseJson(raw);
 }
 
@@ -252,7 +342,9 @@ ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}`;
   }
   prompt += `\n\nWrite the complete contents of ${file.path}.`;
 
+  const t0 = agentStart('coder', 'ollama', cfg.coder_model);
   let content = await chat(cfg, cfg.coder_model, CODER_SYS, prompt);
+  agentDone(t0, `${c.dim}(${content.length} chars)${c.reset}`);
   return stripFences(content);
 }
 
@@ -267,7 +359,9 @@ ${content}
 ${'```'}
 
 Review. Output JSON only.`;
+  const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
   const raw = await chat(cfg, cfg.reviewer_model, REVIEWER_SYS, prompt, true);
+  agentDone(t0);
   return parseJson(raw);
 }
 
@@ -302,15 +396,58 @@ async function planCmd(request) {
   return { blueprint, finalReq };
 }
 
-async function buildCmd(request) {
+async function buildCmd(request, opts = {}) {
   const cfg = loadConfig();
-  const { blueprint } = await planCmd(request);
+
+  // Decide where to build:
+  // - --out flag       → <out>/<slug>/   (nested)
+  // - cfg.out_dir set  → <out_dir>/<slug>/   (nested)
+  // - neither          → cwd IS the plugin folder (no nesting), slug = basename(cwd)
+  let baseDir, cwdMode, augmentedRequest = request, forcedSlug = null;
+  if (opts.out) {
+    baseDir = opts.out;
+    cwdMode = false;
+  } else if (cfg.out_dir && cfg.out_dir.trim()) {
+    baseDir = cfg.out_dir;
+    cwdMode = false;
+  } else {
+    baseDir = process.cwd();
+    cwdMode = true;
+    forcedSlug = basename(baseDir).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!forcedSlug || forcedSlug.length < 2) {
+      bad(`current folder name "${basename(baseDir)}" can't be a plugin slug. cd into a properly-named folder, or use --out <dir>.`);
+      return;
+    }
+    augmentedRequest = `${request}\n\nCONSTRAINT: The plugin slug MUST be exactly "${forcedSlug}". The main PHP file MUST be named "${forcedSlug}.php". Use this slug as the text domain.`;
+  }
+
+  const { blueprint } = await planCmd(augmentedRequest);
+
+  // Belt-and-suspenders: force the slug + main filename even if planner ignored the constraint
+  if (forcedSlug && blueprint.plugin_slug !== forcedSlug) {
+    const oldSlug = blueprint.plugin_slug;
+    blueprint.plugin_slug = forcedSlug;
+    for (const f of blueprint.files) {
+      if (f.path === `${oldSlug}.php`) f.path = `${forcedSlug}.php`;
+    }
+  }
 
   const proceed = await confirm({ message: 'Build this plugin?', default: true });
   if (!proceed) return;
 
-  const repoDir = join(cfg.out_dir, blueprint.plugin_slug);
-  if (existsSync(repoDir)) {
+  const repoDir = cwdMode ? baseDir : join(baseDir, blueprint.plugin_slug);
+  console.log(`\n   ${c.dim}→ ${repoDir}${c.reset}`);
+
+  if (cwdMode) {
+    const conflicts = readdirSync(repoDir).filter(f => !f.startsWith('.') && f !== 'node_modules');
+    if (conflicts.length) {
+      const overwrite = await confirm({
+        message: `${repoDir} is not empty (${conflicts.slice(0, 5).join(', ')}${conflicts.length > 5 ? '…' : ''}). Existing files may be overwritten. Continue?`,
+        default: false,
+      });
+      if (!overwrite) return;
+    }
+  } else if (existsSync(repoDir)) {
     const overwrite = await confirm({ message: `${repoDir} exists. Overwrite?`, default: false });
     if (!overwrite) return;
   }
@@ -378,19 +515,23 @@ async function buildCmd(request) {
 
 function listCmd() {
   const cfg = loadConfig();
-  if (!existsSync(cfg.out_dir)) { console.log('(no builds yet)'); return; }
-  const dirs = readdirSync(cfg.out_dir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name);
-  if (!dirs.length) { console.log('(no builds yet)'); return; }
-  head(`📚 Builds (${dirs.length})`);
+  const dir = (cfg.out_dir && cfg.out_dir.trim()) || process.cwd();
+  if (!existsSync(dir)) { console.log('(no builds yet)'); return; }
+  const dirs = readdirSync(dir, { withFileTypes: true })
+    .filter(d => d.isDirectory() && existsSync(join(dir, d.name, '.git')))
+    .map(d => d.name);
+  if (!dirs.length) { console.log(`(no builds in ${dir})`); return; }
+  head(`📚 Builds in ${dir} (${dirs.length})`);
   console.log();
-  for (const d of dirs) console.log(`  ${d}  ${c.dim}${join(cfg.out_dir, d)}${c.reset}`);
+  for (const d of dirs) console.log(`  ${d}  ${c.dim}${join(dir, d)}${c.reset}`);
   console.log();
 }
 
 async function pushCmd(slug) {
   const cfg = loadConfig();
   if (!cfg.github_owner) return bad('github owner not set — run `marko-agent setup`');
-  const repoDir = join(cfg.out_dir, slug);
+  const baseDir = (cfg.out_dir && cfg.out_dir.trim()) || process.cwd();
+  const repoDir = join(baseDir, slug);
   if (!existsSync(repoDir)) return bad(`${repoDir} does not exist`);
 
   const opts = { cwd: repoDir, stdio: 'inherit' };
@@ -421,10 +562,45 @@ const program = new Command();
 program.name('marko-agent').description('Local multi-agent WordPress plugin builder').version('1.0.0');
 
 program.command('doctor').description('Verify environment').action(doctor);
+program.command('ping').description('Send a tiny request to each agent and report timing').action(async () => {
+  const cfg = loadConfig();
+  head('🏓 Pinging agents');
+  console.log();
+
+  console.log(`${c.bold}1. planner${c.reset}`);
+  try {
+    const t0 = Date.now();
+    const raw = await planChat(cfg, 'Reply with the JSON {"ok":true} and nothing else.', 'ping', 'planner');
+    const parsed = parseJson(raw);
+    parsed.ok ? ok(`planner replied in ${((Date.now() - t0) / 1000).toFixed(1)}s`) : bad(`unexpected reply: ${raw.slice(0, 100)}`);
+  } catch (e) { bad(`planner failed: ${e.message}`); }
+
+  console.log(`\n${c.bold}2. coder${c.reset}`);
+  try {
+    const t0 = agentStart('coder', 'ollama', cfg.coder_model);
+    const out = await chat(cfg, cfg.coder_model, 'Reply with exactly: PONG', 'ping');
+    agentDone(t0);
+    /pong/i.test(out) ? ok(`coder replied`) : warn(`coder replied: ${out.slice(0, 80)}`);
+  } catch (e) { bad(`coder failed: ${e.message}`); }
+
+  console.log(`\n${c.bold}3. reviewer${c.reset}`);
+  try {
+    const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
+    const raw = await chat(cfg, cfg.reviewer_model, 'Reply with the JSON {"ok":true} and nothing else.', 'ping', true);
+    agentDone(t0);
+    const parsed = parseJson(raw);
+    parsed.ok ? ok(`reviewer replied`) : bad(`unexpected reply: ${raw.slice(0, 100)}`);
+  } catch (e) { bad(`reviewer failed: ${e.message}`); }
+
+  console.log();
+});
 program.command('setup').description('Interactive config').action(setup);
 program.command('models').description('List Ollama models and roles').action(modelsCmd);
 program.command('plan <request...>').description('Plan only, do not build').action((req) => planCmd(req.join(' ')));
-program.command('build <request...>').description('Plan and build').action((req) => buildCmd(req.join(' ')));
+program.command('build <request...>')
+  .description('Plan and build (drops plugin in current folder by default)')
+  .option('--out <dir>', 'output to a specific directory (overrides config)')
+  .action((req, opts) => buildCmd(req.join(' '), opts));
 program.command('list').description('List built plugins').action(listCmd);
 program.command('push <slug>').description('Push to GitHub and open PR').action(pushCmd);
 program.command('config [action] [key] [value]').description('Show or set config').action(configCmd);
