@@ -650,8 +650,12 @@ function shouldAuditPath(filePath) {
 function formatAuditedFiles(generatedFiles, changedPaths) {
   const audited = [];
   const unchanged = [];
+  const excluded = [];
   for (const [path, content] of generatedFiles) {
-    if (!shouldAuditPath(path)) continue;
+    if (!shouldAuditPath(path)) {
+      excluded.push(path);
+      continue;
+    }
     if (changedPaths && !changedPaths.has(path)) {
       unchanged.push(path);
     } else {
@@ -661,6 +665,9 @@ function formatAuditedFiles(generatedFiles, changedPaths) {
   let out = audited.join('\n\n');
   if (unchanged.length) {
     out += `\n\n=== UNCHANGED FROM YOUR PRIOR APPROVAL ===\nThe following files have identical content to what you reviewed last round. Re-check only that the regenerated files above remain consistent with their cross-file references into these:\n${unchanged.map(p => `  - ${p}`).join('\n')}`;
+  }
+  if (excluded.length) {
+    out += `\n\n=== INTENTIONALLY EXCLUDED FROM AUDIT ===\nThese files exist in the plugin but are deliberately omitted from this audit (metadata / WP.org docs only, no cross-file dependencies). Do NOT flag them as missing or unauditable:\n${excluded.map(p => `  - ${p}`).join('\n')}`;
   }
   return out;
 }
