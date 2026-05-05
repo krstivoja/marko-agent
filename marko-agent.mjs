@@ -559,7 +559,8 @@ function configCmd(action, key, value) {
 
 // ── CLI ─────────────────────────────────────────────────────────────
 const program = new Command();
-program.name('marko-agent').description('Local multi-agent WordPress plugin builder').version('1.0.0');
+const invokedAs = basename(process.argv[1] || 'marko-agent');
+program.name(invokedAs).description('Local multi-agent WordPress plugin builder').version('1.0.0');
 
 program.command('doctor').description('Verify environment').action(doctor);
 program.command('ping').description('Send a tiny request to each agent and report timing').action(async () => {

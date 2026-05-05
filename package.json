@@ -18,6 +18,7 @@
     "simple-git": "^3.36.0"
   },
   "bin": {
-    "marko-agent": "./marko-agent.mjs"
+    "marko-agent": "./marko-agent.mjs",
+    "mka": "./marko-agent.mjs"
   }
 }
