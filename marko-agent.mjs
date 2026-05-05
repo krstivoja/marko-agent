@@ -144,9 +144,17 @@ Rules:
 - Always include readme.txt
 - 3–8 files unless complexity demands more
 - All user-facing strings translatable
+- ORDER FILES BY DEPENDENCY: files later in the list will be generated with full visibility into the contents of earlier files. Put files that DEFINE shared identifiers (IDs, hook names, localized object keys, nonce actions, AJAX action names, class signatures) BEFORE files that CONSUME those identifiers. Recommended order:
+  1. Main plugin .php file (defines constants, instantiates classes)
+  2. PHP class/include files (define hooks, render HTML with IDs, register AJAX actions, call wp_localize_script)
+  3. JS files (consume DOM IDs, localized object keys, AJAX action names from above)
+  4. CSS files
+  5. uninstall.php
+  6. readme.txt
 - Output ONLY JSON, no prose.`;
 
 const CODER_SYS = `You are a senior WordPress developer. Write production-ready code following WordPress Coding Standards.
+
 Required:
 - ABSPATH guard at top of every PHP file
 - Escape all output (esc_html, esc_attr, esc_url, wp_kses_post)
@@ -156,18 +164,48 @@ Required:
 - Translatable strings with text domain matching plugin slug
 - Proper plugin header in main file
 
+CROSS-FILE CONSISTENCY (CRITICAL):
+When already-generated files are provided as context, you MUST use the EXACT SAME identifiers across files. Do NOT invent new ones. Specifically:
+- DOM element IDs and CSS classes (must match what JS targets and what PHP renders)
+- wp_localize_script object names (the JS-side variable name must match what JS reads)
+- Localized object property keys (e.g. ajax_url vs ajaxurl, nonce key, strings, etc.)
+- AJAX action names (wp_ajax_<action> hook must match the action sent in JS POST)
+- Nonce action names (wp_create_nonce / wp_verify_nonce must use the same string)
+- POST field names (the JS sender's keys must match what the PHP handler reads from $_POST)
+- Class names, constructor signatures, and how they're instantiated
+- Hook callback method names
+- Constant names defined in the main file
+- Capability strings used in add_*_page and current_user_can checks
+
+If an already-generated file requires a constructor argument, the file that instantiates it MUST pass the right arguments. If a class defines define_admin_hooks(), the bootstrapping file MUST call it.
+
 Output ONLY the file contents. No markdown fences. No prose. No explanation.`;
 
-const REVIEWER_SYS = `You are a strict WordPress code reviewer. Check for:
+const REVIEWER_SYS = `You are a strict WordPress code reviewer.
+
+Per-file checks:
 - Security: nonces, capability checks, sanitization, escaping, SQL injection
-- Correctness: hook signatures, syntax, name collisions
+- Correctness: hook signatures, syntax, name collisions, deprecated functions
 - Standards: text domain, ABSPATH guard, WP API usage
+
+CROSS-FILE consistency checks (when already-generated files are provided as context):
+- Do DOM IDs/classes referenced in this file exist in the rendered HTML of sibling files?
+- Does any wp_localize_script object name in a sibling file match the global this file reads?
+- Do localized object property keys agree (ajax_url vs ajaxurl, nonce key, etc.)?
+- Do AJAX action names match between JS sender and PHP wp_ajax_ hook?
+- Do nonce action strings agree across wp_create_nonce / wp_verify_nonce calls?
+- Do POST field names sent by JS match what PHP reads from $_POST?
+- Do class instantiations pass the right number of constructor arguments?
+- Are referenced methods actually called (e.g. define_admin_hooks() exists but never invoked)?
+- Are deprecated WP functions used (wp_get_sites, get_currentuserinfo, etc.)?
+
+Mark cross-file mismatches as severity "blocker" — they break the plugin at runtime.
 
 Output ONLY JSON:
 {
   "approved": true|false,
   "issues": [
-    { "severity": "blocker|major|minor", "category": "security|correctness|standards", "message": "..." }
+    { "severity": "blocker|major|minor", "category": "security|correctness|standards|integration", "message": "..." }
   ]
 }
 approved=true means zero blocker/major issues.`;
@@ -327,7 +365,16 @@ async function planRequest(cfg, request) {
   return parseJson(raw);
 }
 
-async function generateFile(cfg, blueprint, file, prev, notes) {
+function formatPriorFiles(generatedFiles) {
+  if (!generatedFiles || generatedFiles.size === 0) return '';
+  const blocks = [];
+  for (const [path, content] of generatedFiles) {
+    blocks.push(`=== ${path} ===\n${content}`);
+  }
+  return `\n\nALREADY-GENERATED FILES IN THIS PLUGIN (you must be consistent with their identifiers — do not invent new IDs, hook names, object keys, nonce actions, or POST field names):\n\n${blocks.join('\n\n')}`;
+}
+
+async function generateFile(cfg, blueprint, file, prev, notes, generatedFiles) {
   let prompt = `Plugin: ${blueprint.plugin_name} (slug: ${blueprint.plugin_slug})
 Description: ${blueprint.description}
 
@@ -336,6 +383,8 @@ Purpose: ${file.purpose}
 
 All files in plugin:
 ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}`;
+
+  prompt += formatPriorFiles(generatedFiles);
 
   if (prev && notes?.length) {
     prompt += `\n\nReviewer flagged the previous draft. Fix these:\n${notes.map(i => `- [${i.severity}/${i.category}] ${i.message}`).join('\n')}\n\nPrevious draft:\n${prev}`;
@@ -348,17 +397,20 @@ ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}`;
   return stripFences(content);
 }
 
-async function reviewFile(cfg, blueprint, file, content) {
-  const prompt = `Plugin: ${blueprint.plugin_name} (slug: ${blueprint.plugin_slug})
-File: ${file.path}
-Purpose: ${file.purpose}
+async function reviewFile(cfg, blueprint, file, content, generatedFiles) {
+  let prompt = `Plugin: ${blueprint.plugin_name} (slug: ${blueprint.plugin_slug})
+File under review: ${file.path}
+Purpose: ${file.purpose}`;
 
-Contents:
+  prompt += formatPriorFiles(generatedFiles);
+
+  prompt += `\n\nContents of ${file.path}:
 ${'```'}
 ${content}
 ${'```'}
 
-Review. Output JSON only.`;
+Review this file for both per-file issues AND cross-file consistency with the already-generated siblings above. Output JSON only.`;
+
   const t0 = agentStart('reviewer', 'ollama', cfg.reviewer_model);
   const raw = await chat(cfg, cfg.reviewer_model, REVIEWER_SYS, prompt, true);
   agentDone(t0);
@@ -454,13 +506,14 @@ async function buildCmd(request, opts = {}) {
   mkdirSync(repoDir, { recursive: true });
 
   console.log();
+  const generatedFiles = new Map();
   for (const file of blueprint.files) {
     console.log(`${c.bold}📝 ${file.path}${c.reset}`);
     let content = '';
     let notes = [];
     let approved = false;
     for (let round = 1; round <= cfg.max_review_rounds; round++) {
-      content = await generateFile(cfg, blueprint, file, content || null, notes);
+      content = await generateFile(cfg, blueprint, file, content || null, notes, generatedFiles);
 
       const lint = phpLint(content, file.path);
       if (!lint.ok) {
@@ -471,7 +524,7 @@ async function buildCmd(request, opts = {}) {
       }
 
       let review;
-      try { review = await reviewFile(cfg, blueprint, file, content); }
+      try { review = await reviewFile(cfg, blueprint, file, content, generatedFiles); }
       catch (e) {
         console.log(`   ${c.yellow}reviewer parse error, accepting draft${c.reset}`);
         approved = true; break;
@@ -490,6 +543,7 @@ async function buildCmd(request, opts = {}) {
     const dest = join(repoDir, file.path);
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, content);
+    generatedFiles.set(file.path, content);
   }
 
   console.log(`\n${c.cyan}📦 Setting up local git...${c.reset}`);
