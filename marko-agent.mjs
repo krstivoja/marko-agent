@@ -29,6 +29,7 @@ const DEFAULTS = {
   out_dir: DEFAULT_OUT,
   max_review_rounds: 3,
   max_final_review_rounds: 2,
+  planner_thinking: false, // enable internal reasoning for the planner role (helpful for reasoning-tuned models like deepseek-r1)
   github_owner: '',
 };
 
@@ -144,7 +145,7 @@ function claudeChat(system, user) {
   return wrapper.result;
 }
 
-async function chatOllama(cfg, model, system, user, jsonMode) {
+async function chatOllama(cfg, model, system, user, jsonMode, think) {
   const ollama = new Ollama({ host: cfg.ollama_host });
   const opts = {
     model,
@@ -154,18 +155,21 @@ async function chatOllama(cfg, model, system, user, jsonMode) {
     ],
     stream: false,
     options: { temperature: 0.2 },
-    think: false,
+    think: !!think,
   };
   if (jsonMode) opts.format = 'json';
   const r = await ollama.chat(opts);
   return r.message.content;
 }
 
-async function chatLMStudio(cfg, model, system, user, jsonMode) {
+async function chatLMStudio(cfg, model, system, user, jsonMode, think) {
+  // qwen3 family: append /no_think to system prompt to suppress the thinking trace.
+  // Leave it off when think=true so the model uses its native reasoning behavior.
+  const finalSystem = think ? system : `${system}\n\n/no_think`;
   const body = {
     model,
     messages: [
-      { role: 'system', content: system },
+      { role: 'system', content: finalSystem },
       { role: 'user', content: user },
     ],
     temperature: 0.2,
@@ -197,11 +201,11 @@ async function chatLMStudio(cfg, model, system, user, jsonMode) {
   return d.choices?.[0]?.message?.content ?? '';
 }
 
-async function chat(cfg, model, system, user, jsonMode = false) {
+async function chat(cfg, model, system, user, jsonMode = false, think = false) {
   if (cfg.inference_provider === 'lmstudio') {
-    return chatLMStudio(cfg, model, system, user, jsonMode);
+    return chatLMStudio(cfg, model, system, user, jsonMode, think);
   }
-  return chatOllama(cfg, model, system, user, jsonMode);
+  return chatOllama(cfg, model, system, user, jsonMode, think);
 }
 
 // ── prompts ─────────────────────────────────────────────────────────
@@ -504,6 +508,11 @@ async function setup() {
     ? 'Planner fallback model (used if claude CLI fails)'
     : 'Planner model';
   await ask(plannerLabel, 'planner_model');
+
+  cfg.planner_thinking = await confirm({
+    message: 'Enable thinking/reasoning trace for the planner role? (recommended for reasoning-tuned models like deepseek-r1; off for plain coder models)',
+    default: !!cfg.planner_thinking,
+  });
   await ask('Coder model — PHP (and readme.txt)', 'coder_model_php');
   await ask('Coder model — JS / CSS / frontend', 'coder_model_js');
   await ask('Reviewer model', 'reviewer_model');
@@ -557,7 +566,7 @@ async function planChat(cfg, system, user, role = 'planner') {
     }
   }
   const t0 = agentStart(role, cfg.inference_provider, cfg.planner_model);
-  const out = await chat(cfg, cfg.planner_model, system, user, true);
+  const out = await chat(cfg, cfg.planner_model, system, user, true, !!cfg.planner_thinking);
   agentDone(t0, `${c.dim}(${out.length} chars)${c.reset}`);
   return out;
 }
@@ -647,46 +656,33 @@ function shouldAuditPath(filePath) {
   return true;
 }
 
-function formatAuditedFiles(generatedFiles, changedPaths) {
+function formatAuditedFiles(generatedFiles) {
   const audited = [];
-  const unchanged = [];
   const excluded = [];
   for (const [path, content] of generatedFiles) {
     if (!shouldAuditPath(path)) {
       excluded.push(path);
       continue;
     }
-    if (changedPaths && !changedPaths.has(path)) {
-      unchanged.push(path);
-    } else {
-      audited.push(`=== ${path} ===\n${compressForReview(content)}`);
-    }
+    audited.push(`=== ${path} ===\n${compressForReview(content)}`);
   }
   let out = audited.join('\n\n');
-  if (unchanged.length) {
-    out += `\n\n=== UNCHANGED FROM YOUR PRIOR APPROVAL ===\nThe following files have identical content to what you reviewed last round. Re-check only that the regenerated files above remain consistent with their cross-file references into these:\n${unchanged.map(p => `  - ${p}`).join('\n')}`;
-  }
   if (excluded.length) {
     out += `\n\n=== INTENTIONALLY EXCLUDED FROM AUDIT ===\nThese files exist in the plugin but are deliberately omitted from this audit (metadata / WP.org docs only, no cross-file dependencies). Do NOT flag them as missing or unauditable:\n${excluded.map(p => `  - ${p}`).join('\n')}`;
   }
   return out;
 }
 
-function claudeFinalReview(cfg, blueprint, generatedFiles, changedPaths) {
-  const isFirstPass = !changedPaths;
-  const header = isFirstPass
-    ? 'ALL GENERATED FILES (audit holistically — flag cross-file mismatches, security gaps, WPCS violations):'
-    : 'REGENERATED FILES from this round (re-audit these; siblings listed at the bottom are unchanged from your prior approval):';
-
+function claudeFinalReview(cfg, blueprint, generatedFiles) {
   const prompt = `Plugin: ${blueprint.plugin_name} (slug: ${blueprint.plugin_slug})
 Description: ${blueprint.description}
 
 File manifest:
 ${blueprint.files.map(f => `  - ${f.path}: ${f.purpose}`).join('\n')}
 
-${header}
+ALL GENERATED FILES (audit holistically — flag cross-file mismatches, security gaps, WPCS violations). When a fix requires changes in multiple files (e.g. JS reads a key that PHP must localize), list ALL affected files in your "files" array — one entry per file that needs editing.
 
-${formatAuditedFiles(generatedFiles, changedPaths)}
+${formatAuditedFiles(generatedFiles)}
 
 Return your audit as JSON only.`;
 
@@ -712,12 +708,11 @@ async function runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles) {
   const fileByPath = new Map(blueprint.files.map(f => [f.path, f]));
   const maxRounds = cfg.max_final_review_rounds ?? 2;
   let lastReport = null;
-  let changedPaths = null; // null = first pass, send everything
 
   for (let round = 1; round <= maxRounds; round++) {
     let report;
     try {
-      report = claudeFinalReview(cfg, blueprint, generatedFiles, changedPaths);
+      report = claudeFinalReview(cfg, blueprint, generatedFiles);
     } catch (e) {
       console.log(`   ${c.yellow}final review failed (${e.message.split('\n')[0]}) — skipping remaining rounds${c.reset}`);
       return;
@@ -747,7 +742,6 @@ async function runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles) {
 
     if (round === maxRounds) break;
 
-    const regenerated = new Set();
     for (const fr of fileReports) {
       const file = fileByPath.get(fr.path);
       if (!file) {
@@ -771,9 +765,7 @@ async function runFinalReviewLoop(cfg, blueprint, repoDir, generatedFiles) {
       mkdirSync(dirname(dest), { recursive: true });
       writeFileSync(dest, fixed);
       generatedFiles.set(fr.path, fixed);
-      regenerated.add(fr.path);
     }
-    changedPaths = regenerated;
   }
 
   if (lastReport && !lastReport.approved) {
@@ -977,8 +969,14 @@ function configCmd(action, key, value) {
   if (!action) { console.log(JSON.stringify(cfg, null, 2)); return; }
   if (action === 'set') {
     if (!(key in DEFAULTS)) return bad(`unknown key: ${key}\nvalid: ${Object.keys(DEFAULTS).join(', ')}`);
-    const numeric = key === 'max_review_rounds';
-    cfg[key] = numeric ? (parseInt(value) || DEFAULTS[key]) : value;
+    const defaultVal = DEFAULTS[key];
+    if (typeof defaultVal === 'number') {
+      cfg[key] = parseInt(value) || defaultVal;
+    } else if (typeof defaultVal === 'boolean') {
+      cfg[key] = value === 'true' || value === '1' || value === 'yes' || value === 'on';
+    } else {
+      cfg[key] = value;
+    }
     saveConfig(cfg);
     return ok(`${key} = ${cfg[key]}`);
   }
