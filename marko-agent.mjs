@@ -14,16 +14,18 @@ const CONFIG_DIR = join(HOME, '.marko-agent');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
 const DEFAULT_OUT = '';
 
+const DEFAULT_LOCAL_MODEL = 'qwen3-coder-30b-a3b-instruct-mlx@4bit';
+
 const DEFAULTS = {
   ollama_host: 'http://localhost:11434',
-  inference_provider: 'ollama', // 'ollama' or 'lmstudio' (OpenAI-compatible)
+  inference_provider: 'lmstudio', // 'ollama' or 'lmstudio' (OpenAI-compatible)
   lmstudio_host: 'http://localhost:1234',
   planner_provider: 'ollama',
   final_review_provider: 'claude',
-  planner_model: 'qwen3-coder:30b',
-  coder_model_php: 'qwen3-coder:30b',
-  coder_model_js: 'qwen3-coder:30b',
-  reviewer_model: 'qwen3-coder:30b',
+  planner_model: DEFAULT_LOCAL_MODEL,
+  coder_model_php: DEFAULT_LOCAL_MODEL,
+  coder_model_js: DEFAULT_LOCAL_MODEL,
+  reviewer_model: DEFAULT_LOCAL_MODEL,
   out_dir: DEFAULT_OUT,
   max_review_rounds: 3,
   max_final_review_rounds: 2,
